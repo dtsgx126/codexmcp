@@ -142,7 +142,8 @@ def windows_escape(prompt):
 
     **Edge Cases & Best Practices:**
         - Ensure `cd` exists and is accessible; tool fails silently on invalid paths.
-        - For most repos, prefer "read-only" to avoid accidental changes.
+        - When `sandbox` / `yolo` are omitted, the values in ~/.codex/config.toml (sandbox_mode, approval_policy) take effect.
+        - Pass `sandbox="read-only"` explicitly for review/analysis tasks that must not modify files.
         - If needed, set `return_all_messages` to `True` to parse "all_messages" for detailed tracing (e.g., reasoning, tool calls, etc.).
     """,
     meta={"version": "0.0.0", "author": "guda.studio"},
@@ -151,11 +152,11 @@ async def codex(
     PROMPT: Annotated[str, "Instruction for the task to send to codex."],
     cd: Annotated[Path, "Set the workspace root for codex before executing the task."],
     sandbox: Annotated[
-        Literal["read-only", "workspace-write", "danger-full-access"],
+        Optional[Literal["read-only", "workspace-write", "danger-full-access"]],
         Field(
-            description="Sandbox policy for model-generated commands. Defaults to `read-only`."
+            description="Sandbox policy. If omitted, codex CLI uses `sandbox_mode` from ~/.codex/config.toml. Pass explicitly to override."
         ),
-    ] = "read-only",
+    ] = None,
     SESSION_ID: Annotated[
         str,
         "Resume the specified session of the codex. Defaults to `None`, start a new session.",
@@ -181,11 +182,11 @@ async def codex(
         ),
     ] = "",
     yolo: Annotated[
-        bool,
+        Optional[bool],
         Field(
-            description="Run every command without approvals or sandboxing. Only use when `sandbox` couldn't be applied.",
+            description="Skip all approvals. If omitted, codex CLI uses `approval_policy` from ~/.codex/config.toml. Pass True explicitly to force unattended execution.",
         ),
-    ] = False,
+    ] = None,
     profile: Annotated[
         str,
         "Configuration profile name to load from `~/.codex/config.toml`. This parameter is strictly prohibited unless explicitly specified by the user.",
@@ -193,18 +194,22 @@ async def codex(
 ) -> Dict[str, Any]:
     """Execute a Codex CLI session and return the results."""
     # Build command as list to avoid injection
-    cmd = ["codex", "exec", "--sandbox", sandbox, "--cd", str(cd), "--json"]
-    
+    cmd = ["codex", "exec", "--cd", str(cd), "--json"]
+
+    # sandbox/yolo 省略时不传 flag，让 codex CLI 使用 ~/.codex/config.toml 的值
+    if sandbox is not None:
+        cmd.extend(["--sandbox", sandbox])
+
     if len(image):
         cmd.extend(["--image", ",".join(image)])
-        
+
     if model:
         cmd.extend(["--model", model])
-        
+
     if profile:
         cmd.extend(["--profile", profile])
-        
-    if yolo:
+
+    if yolo is True:
         cmd.append("--yolo")
     
     if skip_git_repo_check:
