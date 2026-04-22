@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codexmcp"
-version = "0.7.4"
+version = "0.8.0"
 description = "FastMCP server wrapping the Codex CLI."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -30,8 +30,16 @@ Homepage = "https://github.com/GuDaStudio/codexmcp"
 [project.scripts]
 codexmcp = "codexmcp.cli:main"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/codexmcp"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/codexmcp", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

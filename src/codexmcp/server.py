@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Annotated, Any, Dict, Generator, List, Literal, Optional
+from typing import Annotated, Any, Dict, Generator, List, Literal, Optional, Tuple
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BeforeValidator, Field
@@ -201,7 +202,9 @@ async def codex(
         cmd.extend(["--sandbox", sandbox])
 
     if len(image):
-        cmd.extend(["--image", ",".join(image)])
+        # 修复 Windows 下 Path 对象拼接报错:
+        # `sequence item 0: expected str instance, WindowsPath found`
+        cmd.extend(["--image", ",".join(str(p) for p in image)])
 
     if model:
         cmd.extend(["--model", model])
@@ -286,6 +289,221 @@ async def codex(
             result["all_messages"] = all_messages
 
     return result
+
+
+# =============================================================================
+# image_generate 专用工具(2026-04 新增)
+# 走 codex CLI 的 `$imagegen` 技能,调用 gpt-image-2,消耗 Codex 订阅额度。
+# =============================================================================
+
+_IMAGEGEN_PROMPT_TEMPLATE = (
+    "$imagegen {user_prompt}\n\n"
+    "# 严格输出约定(必须遵守)\n"
+    "- 生成 {aspect_ratio} 比例的图\n"
+    "- 保存到: {output_path}\n"
+    "- 成功仅输出一行: GENERATED_OK: {output_path}\n"
+    "- 失败仅输出一行: GENERATED_FAIL: <原因>\n"
+    "- 不要自评、不要解释、不要多余文字"
+)
+
+
+def _build_imagegen_prompt(
+    user_prompt: str, output_path: str, aspect_ratio: str
+) -> str:
+    """拼装 `$imagegen` 的严格输出约定 prompt。"""
+    return _IMAGEGEN_PROMPT_TEMPLATE.format(
+        user_prompt=user_prompt,
+        output_path=output_path,
+        aspect_ratio=aspect_ratio,
+    )
+
+
+def _read_png_size(path: str) -> Optional[Tuple[int, int]]:
+    """从 PNG 文件头读取 `(width, height)`。非 PNG 或失败返回 None。"""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(24)
+    except OSError:
+        return None
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    # IHDR chunk: width(4 bytes) + height(4 bytes) at offset 16-24
+    width = int.from_bytes(header[16:20], "big")
+    height = int.from_bytes(header[20:24], "big")
+    return (width, height)
+
+
+def _locate_image_output(
+    expected_path: str, session_id: Optional[str]
+) -> Optional[str]:
+    """验证输出文件;不在预期位置就扫 codex 默认目录做 fallback。
+
+    Codex `$imagegen` 默认落盘到 `~/.codex/generated_images/<session>/ig_*.png`,
+    有时不会复制到 user 指定路径。这里做一层兜底。
+    """
+    expected = Path(expected_path)
+    if expected.exists() and expected.stat().st_size > 1024:
+        return str(expected)
+
+    if not session_id:
+        return None
+
+    default_dir = Path.home() / ".codex" / "generated_images" / session_id
+    if not default_dir.exists():
+        return None
+
+    candidates = sorted(
+        default_dir.glob("ig_*.png"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        return None
+
+    # 只在 fallback 路径才会 import
+    import shutil as _shutil  # noqa: PLC0415
+
+    latest = candidates[0]
+    expected.parent.mkdir(parents=True, exist_ok=True)
+    _shutil.copy2(latest, expected)
+    return str(expected)
+
+
+@mcp.tool(
+    name="image_generate",
+    description="""
+    Dedicated image-generation tool that invokes Codex CLI's `$imagegen` skill
+    and uses the Codex subscription to call gpt-image-2.
+
+    Compared to the generic `codex` tool:
+      - Silent output: only a structured result is returned (agent reasoning text dropped).
+      - Clear parameters: prompt / output_path / aspect_ratio / input_images map 1:1.
+      - No automatic retries (avoid double-billing subscription quota).
+      - Windows-path safe for input_images.
+
+    Requirements:
+      - Codex CLI >= 0.122.0 with `image_generation` feature = stable + true.
+
+    Notes:
+      - Codex's raw output is always 1254x1254; it auto-post-processes to the
+        target aspect ratio. `original_size` reflects the final file on disk.
+      - One logical call may consume >=1 subscription image because Codex
+        sometimes self-reviews and regenerates internally.
+    """,
+    meta={"version": "0.1.0", "author": "dtsgx126"},
+)
+async def image_generate(
+    prompt: Annotated[str, "图像描述,中英文均可"],
+    output_path: Annotated[
+        str, "最终 PNG 输出路径,相对或绝对均可;函数内部会 resolve"
+    ],
+    cd: Annotated[Path, "codex exec 的工作目录,必须存在"],
+    input_images: Annotated[
+        List[Path],
+        Field(
+            description=(
+                "图生图:参考图路径列表;Path 会自动转 str 绕开 Windows Path bug"
+            ),
+        ),
+    ] = [],
+    aspect_ratio: Annotated[
+        Literal["1:1", "16:9", "9:16", "4:3", "3:4"],
+        Field(default="1:1", description="输出比例;Codex 自动后处理裁剪"),
+    ] = "1:1",
+    timeout_seconds: Annotated[
+        int,
+        Field(default=300, ge=10, le=900, description="子进程超时(10-900 秒)"),
+    ] = 300,
+) -> Dict[str, Any]:
+    """调用 codex `$imagegen` 出图,静默输出。
+
+    返回:
+        {
+            "success": bool,
+            "path": str,              # 落盘绝对路径
+            "session_id": str,        # codex thread_id
+            "elapsed_seconds": float,
+            "original_size": [w, h] | None,
+            "error": str              # 仅 success=False 时有意义
+        }
+    """
+    output_path_abs = str(Path(output_path).resolve())
+    cd_str = str(Path(cd).resolve())
+
+    Path(output_path_abs).parent.mkdir(parents=True, exist_ok=True)
+
+    full_prompt = _build_imagegen_prompt(prompt, output_path_abs, aspect_ratio)
+    if os.name == "nt":
+        full_prompt = windows_escape(full_prompt)
+
+    cmd = [
+        "codex",
+        "exec",
+        "--cd",
+        cd_str,
+        "--json",
+        "--skip-git-repo-check",
+    ]
+    if input_images:
+        cmd.extend(
+            ["--image", ",".join(str(p) for p in input_images)]
+        )
+    cmd += ["--", full_prompt]
+
+    start = time.monotonic()
+    thread_id: Optional[str] = None
+    err_message = ""
+
+    try:
+        for line in run_shell_command(cmd):
+            try:
+                line_dict = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+
+            if line_dict.get("thread_id"):
+                thread_id = line_dict["thread_id"]
+
+            line_type = line_dict.get("type", "")
+            if "fail" in line_type:
+                err_message += "\n" + line_dict.get("error", {}).get("message", "")
+            elif "error" in line_type:
+                msg = line_dict.get("message", "")
+                if not re.match(r"^Reconnecting\.\.\.\s+\d+/\d+", msg):
+                    err_message += "\n" + msg
+    except Exception as exc:  # 防御外层子进程异常
+        return {
+            "success": False,
+            "error": f"subprocess 异常: {exc}",
+            "path": output_path_abs,
+            "session_id": thread_id or "",
+            "elapsed_seconds": time.monotonic() - start,
+            "original_size": None,
+        }
+
+    elapsed = time.monotonic() - start
+    actual_path = _locate_image_output(output_path_abs, thread_id)
+
+    if actual_path is None:
+        return {
+            "success": False,
+            "error": (
+                "输出文件未生成(目标路径和 fallback 目录都没找到)\n"
+                + err_message
+            ).strip(),
+            "path": output_path_abs,
+            "session_id": thread_id or "",
+            "elapsed_seconds": elapsed,
+            "original_size": None,
+        }
+
+    return {
+        "success": True,
+        "path": actual_path,
+        "session_id": thread_id or "",
+        "elapsed_seconds": elapsed,
+        "original_size": _read_png_size(actual_path),
+    }
 
 
 def run() -> None:
